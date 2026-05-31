@@ -1,0 +1,1575 @@
+IAX Installation Guide for contoso
+Version: 2.17.3/6
+
+Target Environment: AWS EKS (Air-gapped)
+
+Table of Contents
+1.	Overview
+2.	Prerequisites
+3.	Phase 1: Admin Setup (One-Time)
+4.	Phase 2: CRD and Webhook Installation (One-Time)
+5.	Phase 3: Operator Installation
+6.	Phase 4: IAX Platform Installation
+7.	Phase 5: Applications Installation
+8.	Phase 6: Support Bundle Collection Setup
+9.	Verification
+
+ contoso
+Environment:
+·	AWS EKS in us-east-1, Dev environment
+·	Multi-AZ deployment (2 AZs, same region)
+·	Medium HA configuration
+·	xcom recommends: 6 nodes × r5.8xlarge (32 vCPU, 256 GiB RAM per node)
+Networking:
+·	NGINX Ingress Controller (pre-installed)
+·	Network flow: NLB (public) → ALB (private) → NGINX Ingress
+·	DNS entries in Route53 (*.contoso.net hostnames)
+·	NetworkPolicies enabled (allow-all policy required)
+Security:
+·	Pod Security Standard: restricted
+·	No policy enforcement tools (OPA Gatekeeper, Kyverno, etc.)
+·	Self-signed certificates for operator webhook
+·	Enterprise PKI certificates for ingress TLS
+RBAC:
+·	Namespace-scoped deployment in <target-namespace> namespace
+·	Admin installs the IAXPlatform CRD and ValidatingWebhookConfiguration (one-time, cluster-level; the CRD defines namespace-scoped resources, the VWC validates resources in specified namespaces)
+·	Installer has permissions to create ServiceAccounts, Roles, RoleBindings with escalate and bind verbs
+Registry:
+·	Artifactory (air-gapped)
+·	All images pre-pushed before installation
+Storage:
+·	gp3 is the default StorageClass for the cluster
+Cluster Constraints:
+·	No service mesh expected; Calico/Cilium only if NetworkPolicies are enabled later
+·	No pod-limits or ulimit constraints are currently imposed
+Availability Expectations:
+·	DEV: Acceptable to experience short delays if a node fails; ingestion should remain consistent
+·	UAT/PROD: Expectation of zero user-visible downtime and an SLA of 2–4 hours recovery for major issues
+Scope:
+·	This document covers initial installation only
+·	Future integrations (SSO, external secrets manager) are not covered
+
+Prerequisites
+1. Kubernetes Cluster
+·	AWS EKS cluster version 1.32
+·	Multi-AZ deployment in us-east-1
+·	Target namespace: <target-namespace>
+Resource Requirements (from xcom Analytics Sizer):
+·	Minimum: 59.18 cores and 219.11 GiB
+·	Recommended: 170.55 cores and 317.84 GiB
+xcom Recommendation: 6 worker nodes × r5.8xlarge (32 vCPU, 256 GiB RAM per node)
+Node Layout for Medium HA:
+·	3 nodes dedicated to TimescaleDB (labeled instancegroup=timescale-nodes)
+·	3 nodes for all other platform components
+·	Each node: r5.8xlarge (32 vCPU, 256 GiB RAM)
+This is based on the output of the xcom Analytics Sizer for Medium HA configuration. The Medium HA configuration requires TimescaleDB to run on dedicated nodes for optimal performance (see section 6 for node labeling/tainting setup).
+The <target-namespace> namespace must exist before installation.
+2. Required Access
+Admin (for Phase 1 & 2):
+·	Permissions to create the IAXPlatform CRD and ValidatingWebhookConfiguration (cluster-level)
+·	Permissions to create NetworkPolicies in target namespace
+Installer (for Phase 3, 4 & 5):
+·	Permissions to create Deployments, Services, ConfigMaps, Secrets in target namespace
+·	Permissions to create/manage IAXPlatform custom resources
+·	Permissions to create ServiceAccounts, Roles, RoleBindings (with escalate and bind verbs)
+2.1 support-bundle kubectl Plugin (Required for Phase 6)
+The support bundle collection commands in this guide use the kubectl support-bundle plugin.
+Official source:
+·	GitHub releases: https://github.com/replicatedhq/troubleshoot/releases
+Install the plugin on the machine where you run kubectl:
+Linux (x86_64):
+SB_VERSION="v0.120.3"
+curl -L "https://github.com/replicatedhq/troubleshoot/releases/download/${SB_VERSION}/troubleshoot_${SB_VERSION#v}_linux_amd64.tar.gz" -o troubleshoot.tar.gz
+tar -xzf troubleshoot.tar.gz
+chmod +x support-bundle
+sudo mv support-bundle /usr/local/bin/kubectl-support_bundle
+
+macOS (arm64 / Apple Silicon):
+SB_VERSION="v0.120.3"
+curl -L "https://github.com/replicatedhq/troubleshoot/releases/download/${SB_VERSION}/troubleshoot_${SB_VERSION#v}_darwin_arm64.tar.gz" -o troubleshoot.tar.gz
+tar -xzf troubleshoot.tar.gz
+chmod +x support-bundle
+sudo mv support-bundle /usr/local/bin/kubectl-support_bundle
+
+macOS (Intel x86_64):
+SB_VERSION="v0.120.3"
+curl -L "https://github.com/replicatedhq/troubleshoot/releases/download/${SB_VERSION}/troubleshoot_${SB_VERSION#v}_darwin_amd64.tar.gz" -o troubleshoot.tar.gz
+tar -xzf troubleshoot.tar.gz
+chmod +x support-bundle
+sudo mv support-bundle /usr/local/bin/kubectl-support_bundle
+
+Verify installation:
+kubectl support-bundle version
+
+If kubectl cannot find the plugin, ensure /usr/local/bin is in your PATH.
+3. Helm Charts
+Downloading Charts from x Registry
+Before installation, download all required Helm charts from the x OCI registry.
+Registry Credentials: Your xcom account manager will provide your registry username and password. These credentials are separate from your image registry credentials.
+Download all required charts:
+# Set your x registry credentials
+export REGISTRY_USERNAME="your-username@example.com"
+export REGISTRY_PASSWORD="your-password"
+export CHARTS_DIR="./charts"
+export VERSION="2.17.3"
+
+# Create charts directory
+mkdir -p $CHARTS_DIR
+
+# Login to x registry
+helm registry login registry.xcomgroup.com \
+  --username $REGISTRY_USERNAME \
+  --password $REGISTRY_PASSWORD
+
+# Download all required charts
+helm pull oci://registry.xcomgroup.com/xx/iax-operator-crd --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-operator-namespaced --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-webconsole --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-query-service --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-entities --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-commands --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-iam --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-ingestion --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-alerting --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-api-gateway --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-notifications --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-dashboard --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-audit --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-traces --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-signal-forecaster --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-capacity-planner --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-capacity --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-centralised-config --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-fixmonitor --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-app-signal-generator --version $VERSION -d $CHARTS_DIR && \
+helm pull oci://registry.xcomgroup.com/xx/iax-installation-support --version $VERSION -d $CHARTS_DIR
+
+Verify downloads:
+ls -lh $CHARTS_DIR/*.tgz
+
+You should see 22 chart tarballs totaling approximately 45-55 MB.
+4. Image Registry Access (Air-gapped)
+All required container images must be pushed to Artifactory before installation:
+Registry URL: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+
+Repository: obcerv
+
+Pull Secret Name: artifactory-pull-secret
+Ensure your namespace has pull access to the Artifactory registry. The pull secret must be created before installation:
+kubectl create secret docker-registry artifactory-pull-secret \
+  --docker-server=containerregistry-na.contosohase.net \
+  --docker-username=<your-username> \
+  --docker-password=<your-password> \
+  -n <target-namespace>
+
+Verification: Test pulling a sample image before proceeding:
+kubectl run test-pull --image=containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com/obcerv/operator:2.17.3 \
+  --image-pull-policy=Always --restart=Never -n <target-namespace> --dry-run=client
+
+5. Ingress and Load Balancing
+contoso uses the following network architecture for ingress traffic:
+Network Flow:
+Internet → NLB (public subnet) → ALB (private subnet) → NGINX Ingress Controller → IAX Services
+
+Components:
+·	NLB (Network Load Balancer): Deployed in public subnet, handles external traffic
+·	ALB (Application Load Balancer): Deployed in private subnet, routes to NGINX Ingress
+·	NGINX Ingress Controller: Pre-installed in EKS cluster, handles TLS termination and routing
+Requirements:
+·	NGINX Ingress Controller must support:
+o	gRPC and HTTP/2 (for ingestion traffic)
+o	TLS termination
+o	Path-based routing
+·	Load balancers must be configured before installation
+·	No special constraints on HTTP/2 or gRPC beyond current contoso standards
+6. Storage Classes
+The platform requires dynamic storage provisioning for stateful components.
+gp3 is the default StorageClass for the cluster. The values in this guide use gp3 for all platform components.
+Discussion: gp3 vs io2 for TimescaleDB
+TimescaleDB is the most storage-intensive component and benefits from higher IOPS. There are two options:
+Option	Storage for TimescaleDB	Pros	Cons
+A. Use gp3 for everything	gp3 (3000 IOPS baseline)	Simpler setup, lower cost	May see performance issues under heavy load
+B. Use io2 for TimescaleDB	io2 (configurable IOPS)	Better performance for database workloads	Requires io2 StorageClass, higher cost
+
+If contoso has an io2 StorageClass available (or can create one), it should be used for TimescaleDB by setting these values:
+iax:
+  timescale:
+    dataStorageClass: io2
+    walStorageClass: io2
+    timeseriesStorageClass: io2
+
+The current values in this guide use Option A (gp3 for everything). Adjust if io2 is available.
+Reserved Nodes for TimescaleDB (Required for Medium HA)
+The Medium HA configuration requires TimescaleDB to run on 3 dedicated nodes. This isolates the database workload from other platform components and ensures optimal performance.
+Node Requirements per TimescaleDB Node:
+·	Memory: At least 56 GiB available for TimescaleDB pods
+·	CPU: At least 8 cores
+·	Recommended instance type: r5.8xlarge (32 vCPU, 256 GiB)
+Setup Steps:
+1.	Label all 3 TimescaleDB nodes:
+2.	kubectl label nodes <node-1-name> instancegroup=timescale-nodes
+kubectl label nodes <node-2-name> instancegroup=timescale-nodes
+kubectl label nodes <node-3-name> instancegroup=timescale-nodes
+
+3.	Taint all 3 TimescaleDB nodes:
+4.	kubectl taint nodes <node-1-name> dedicated=timescale-nodes:NoSchedule
+kubectl taint nodes <node-2-name> dedicated=timescale-nodes:NoSchedule
+kubectl taint nodes <node-3-name> dedicated=timescale-nodes:NoSchedule
+
+5.	Platform values (already configured in this guide):
+6.	iax:
+  timescale:
+    clusterSize: 3
+    nodeSelector:
+      instancegroup: timescale-nodes
+    tolerations:
+    - key: dedicated
+      operator: Equal
+      value: timescale-nodes
+      effect: NoSchedule
+
+The taints ensure that only TimescaleDB pods (which have matching tolerations) are scheduled on these nodes.
+Total Cluster Layout:
+·	3 nodes: Dedicated to TimescaleDB (r5.8xlarge recommended)
+·	3 nodes: For all other platform components (r5.8xlarge recommended)
+See xcom Analytics Configuration Reference for more details.
+6.1. Storage Sizing and Expansion
+Reference Disk Sizes are Starting Points
+The disk sizes in the reference configuration (Medium HA) are sized for the selected t-shirt size and should be considered starting points only. Actual disk usage will vary significantly based on:
+·	Ingested data volume: Message rate (metrics/second) and entity count
+·	Configured retention periods: See timescale.retention settings (7d-1y depending on bucket) and kafka.defaultRetentionMillis (default 6 hours)
+You should monitor disk usage and expand storage as needed based on your actual workload.
+Stateful Components with Disk Storage
+The following platform components have persistent storage requirements:
+·	Kafka: Stores streaming data (default 6-hour retention) - diskSize: "200Gi" in the reference configuration
+·	TimescaleDB: Stores metrics data with configurable retention:
+o	dataDiskSize: "100Gi" - Non-timeseries data (entities, configuration)
+o	timeseriesDiskSize: "1Ti" × 4 disks - Timeseries metrics data
+o	walDiskSize: "250Gi" - Write-ahead log for replication
+o	Retention ranges from 7 days (raw metrics) to 1 year (daily aggregates)
+·	ClickHouse: Stores trace data - diskSize: "60Gi" in the reference configuration
+·	Etcd: Stores kvStore data (small, relatively static)
+Storage Class Requirements for Expansion
+Storage classes must have allowVolumeExpansion: true to support expanding PVCs without downtime. Verify your storage class supports volume expansion:
+kubectl get storageclass <storage-class-name> -o jsonpath='{.allowVolumeExpansion}'
+
+If this returns true, the storage class supports expansion.
+Expanding Persistent Volume Claims
+Disk size parameters in the Helm chart values are immutable - they define the initial size when PVCs are created. If you need to expand storage after installation, you must modify the PVC directly using kubectl, not by changing the Helm chart values.
+Procedure to expand a PVC:
+1.	Identify the PVC to expand:
+2.	kubectl get pvc -n <target-namespace>
+
+3.	Common PVC naming patterns:
+o	Kafka: iax-kafka-data-kafka-0, iax-kafka-data-kafka-1, iax-kafka-data-kafka-2
+o	TimescaleDB data: iax-timescale-data-timescale-0, iax-timescale-data-timescale-1, iax-timescale-data-timescale-2
+o	TimescaleDB timeseries: iax-timescale-timeseries-0-timescale-0, iax-timescale-timeseries-1-timescale-0, etc.
+o	TimescaleDB WAL: iax-timescale-wal-timescale-0, iax-timescale-wal-timescale-1, iax-timescale-wal-timescale-2
+o	ClickHouse: iax-clickhouse-traces-data-clickhouse-traces-0, iax-clickhouse-traces-data-clickhouse-traces-1
+4.	Patch the PVC with the new size:
+5.	kubectl patch pvc <pvc-name> -n <target-namespace> -p '{"spec":{"resources":{"requests":{"storage":"<new-size>"}}}}'
+
+6.	Example:
+7.	kubectl patch pvc iax-kafka-data-kafka-0 -n <target-namespace> -p '{"spec":{"resources":{"requests":{"storage":"200Gi"}}}}'
+
+8.	Verify the expansion completed:
+9.	kubectl get pvc <pvc-name> -n <target-namespace>
+
+Important notes:
+·	PVCs can typically only be grown, not shrunk (standard Kubernetes behavior)
+·	The storage class must have allowVolumeExpansion: true
+·	For StatefulSets with multiple replicas (Kafka, TimescaleDB), you must expand each replica's PVC individually
+·	The pod using the PVC may need to be restarted for the filesystem to recognize the new size (depends on the storage provisioner)
+Monitoring Disk Usage
+Monitor PVC usage regularly to identify when expansion is needed:
+# Check PVC capacity and status
+kubectl get pvc -n <target-namespace>
+
+# Check actual disk usage inside a pod
+kubectl exec -n <target-namespace> <pod-name> -- df -h
+
+Example for Kafka:
+kubectl exec -n <target-namespace> kafka-0 -- df -h /var/lib/kafka/data
+
+Example for TimescaleDB:
+kubectl exec -n <target-namespace> timescale-0 -c timescale -- df -h /var/lib/postgresql/data
+
+7. Pod Security Standards
+We expect the <target-namespace> namespace to have PSS restricted level. IAX 2.17.3 is fully compatible with PSS restricted.
+Default security context:
+securityContext:
+  pod:
+    runAsUser: 10000
+    runAsGroup: 10000
+    supplementalGroups: [10000]
+    fsGroup: 10000
+    fsGroupChangePolicy: "OnRootMismatch"
+  container:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+    seccompProfile:
+      type: RuntimeDefault
+
+Customizing Security Contexts: If contoso requires specific UID/GID ranges (different from default 10000), security contexts can be customized in the Helm values. Note that changing runAsUser after installation requires manual intervention. Configure the correct values before initial deployment.
+See Configure security contexts for details.
+8. Network Policies
+contoso has NetworkPolicies enabled in the cluster. An allow-all NetworkPolicy for the <target-namespace> namespace must be created by the admin (see Phase 1).
+9. TLS Certificates (Required)
+A. Operator Webhook Certificate (required before operator installation):
+The operator webhook requires a certificate in PKCS12 format. You will need to provide:
+1.	A certificate with CN: iax-operator-webhook.<target-namespace>.svc
+
+(where <target-namespace> is your target namespace)
+2.	The certificate MUST include Subject Alternative Names (SANs):
+o	iax-operator-webhook.<target-namespace>.svc
+o	iax-operator-webhook.<target-namespace>.svc.cluster.local
+3.	The certificate and private key packaged in a PKCS12 keystore file
+4.	The password protecting the PKCS12 file
+5.	The CA certificate that signed the webhook certificate
+Steps to create operator webhook certificate:
+1.	Generate certificate from your enterprise PKI with:
+o	CN: iax-operator-webhook.<target-namespace>.svc
+o	SANs: iax-operator-webhook.<target-namespace>.svc and iax-operator-webhook.<target-namespace>.svc.cluster.local
+2.	Convert to PKCS12 format (if not already in PKCS12):
+3.	openssl pkcs12 -export \
+  -in webhook-cert.pem \
+  -inkey webhook-key.pem \
+  -out keystore.p12 \
+  -password pass:your-password-here
+
+4.	Verify the certificate includes SANs (before proceeding):
+5.	openssl x509 -in webhook-cert.pem -noout -text | grep -A 2 "Subject Alternative Name"
+
+6.	You should see output similar to:
+7.	X509v3 Subject Alternative Name:
+    DNS:iax-operator-webhook.<target-namespace>.svc, DNS:iax-operator-webhook.<target-namespace>.svc.cluster.local
+
+8.	Important: Kubernetes 1.19+ requires certificates to include Subject Alternative Names (SANs). Certificates with only the Common Name (CN) field are no longer accepted. If SANs are missing, the platform installation will fail with error: x509: certificate relies on legacy Common Name field, use SANs instead.
+9.	Create Kubernetes secrets:
+10.	# Secret containing the PKCS12 keystore
+kubectl create secret generic iax-operator-webhook-tls \
+  --from-file=keystore.p12=keystore.p12 \
+  -n <target-namespace>
+
+# Secret containing the keystore password
+kubectl create secret generic iax-operator-webhook-tls-password \
+  --from-literal=password='your-password-here' \
+  -n <target-namespace>
+
+11.	Get base64-encoded CA certificate:
+12.	cat ca.crt | base64 -w 0
+
+13.	Save this output - you'll need it in the CRD chart values file (Phase 2).
+B. Ingress Certificates (required before platform installation):
+The ingress certificates use standard Kubernetes TLS secrets (PEM format).
+DNS Entries:
+
+contoso will create DNS entries in Route53 for both FQDNs before installation:
+·	Apps hostname: <app-fqdn>.contoso.net (for Web Console and application access)
+·	Ingestion hostname: <ingestion-fqdn>.contoso.net (for data source ingestion)
+The exact hostnames will be in the standard *.contoso.net format and provided by contoso before installation.
+TLS Certificates:
+
+contoso will provide TLS certificates from their certificate authority. The certificates must:
+·	Be in PEM format with full chain (certificate + intermediates)
+·	Include Subject Alternative Names (SANs) - required for Kubernetes 1.19+
+·	Have the private key available
+Create the ingress certificate secrets before platform installation:
+# Apps ingress certificate
+kubectl create secret tls apps-ingress-tls \
+  --cert=apps-fullchain.pem \
+  --key=apps-key.pem \
+  -n <target-namespace>
+
+# Ingestion ingress certificate
+kubectl create secret tls ingestion-ingress-tls \
+  --cert=ingestion-fullchain.pem \
+  --key=ingestion-key.pem \
+  -n <target-namespace>
+
+10. IAM Initial Credentials (Optional)
+By default, the operator generates random passwords for IAM service accounts and stores them in the iam-initial-credentials secret.
+If you prefer to set specific passwords (e.g., for easier initial access), you can pre-create this secret before installing the platform:
+kubectl create secret generic iam-initial-credentials \
+  --from-literal=iam-admin=YourPassword123 \
+  --from-literal=obcerv-admin=YourPassword123 \
+  --from-literal=obcerv-ingestion-api=YourPassword123 \
+  --from-literal=obcerv-xcom=YourPassword123 \
+  -n <target-namespace>
+
+Security Note: These are initial credentials only. You should change them after first login through the Web Console.
+If you don't pre-create this secret, the operator will generate it automatically, and you can retrieve the generated passwords using:
+# Get the obcerv-admin password (main admin user)
+kubectl get secret iam-initial-credentials -n <target-namespace> \
+  -o jsonpath='{.data.obcerv-admin}' | base64 -d
+
+
+Phase 1: Admin Setup (One-Time)
+Performed by: Kubernetes administrator
+
+Frequency: One-time per cluster
+Step 1.1: Create NetworkPolicy
+Since NetworkPolicies are enabled in the cluster, create a NetworkPolicy to allow required traffic for the IAX platform.
+Save the following as allow-all-networkpolicy.yaml:
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: iax-allow-all
+  namespace: <target-namespace>
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - {}
+  egress:
+    - {}
+
+Note: This is a permissive NetworkPolicy that allows all traffic within the namespace and to/from external sources. If you require more restrictive policies, you will need to define specific rules for:
+·	Pod-to-pod communication within the namespace
+·	Ingress from NGINX ingress controller
+·	Egress to external DNS, NTP, and any external services
+Apply:
+kubectl apply -f allow-all-networkpolicy.yaml
+
+Step 1.2: Verify Admin Setup
+kubectl get networkpolicy iax-allow-all -n <target-namespace>
+
+
+Phase 2: CRD and Webhook Installation (One-Time)
+Performed by: Kubernetes administrator
+
+Frequency: One-time per cluster
+What This Chart Installs:
+The iax-operator-crd chart installs two cluster-scoped resources:
+1.	IAXPlatform CustomResourceDefinition (CRD): Defines the IAXPlatform custom resource type. The CRD itself is cluster-scoped (all CRDs are), but IAXPlatform resources created from it are namespace-scoped (scope: Namespaced).
+2.	ValidatingWebhookConfiguration (VWC): A validating admission webhook that validates IAXPlatform resources before they are accepted by Kubernetes. This ensures configuration values are well-formed before deployment. The VWC is a cluster-scoped resource but has scope: Namespaced, meaning it only validates resources in the specified namespace(s).
+Admin Permissions Required:
+The administrator running this phase must have cluster-level permissions to create:
+·	customresourcedefinitions in API group apiextensions.k8s.io
+·	validatingwebhookconfigurations in API group admissionregistration.k8s.io
+Namespace Scoping:
+Although the CRD and VWC are cluster-scoped, the IAXPlatform resources they define are namespace-scoped:
+·	Admin installs the CRD and VWC once (cluster-level operation)
+·	Users can then create IAXPlatform resources in their own namespaces
+·	Each namespace can have its own IAX platform deployment
+·	This enables multi-tenancy while maintaining security boundaries
+Step 2.1: Create CRD Values File
+Save as crd-values.yaml:
+operator-crd:
+  webhook:
+    tls:
+      selfSigned: false
+      caCertificate: "<base64-encoded-CA-certificate>"
+
+Replace <base64-encoded-CA-certificate> with the base64-encoded CA certificate from Prerequisites Section 9.
+Step 2.2: Install IAXPlatform CRD and VWC
+helm install iax-operator-crd ./iax-operator-crd-2.17.3.tgz \
+  --values crd-values.yaml \
+  -n <target-namespace>
+
+Step 2.3: Verify CRD and VWC Installation
+Verify CRD:
+kubectl get crd iaxplatforms.xcomgroup.com
+
+Expected output:
+NAME                           CREATED AT
+iaxplatforms.xcomgroup.com     2025-12-02T...
+
+Verify the CRD scope:
+kubectl get crd iaxplatforms.xcomgroup.com -o jsonpath='{.spec.scope}'
+
+Expected output: Namespaced
+Verify VWC:
+kubectl get validatingwebhookconfiguration | grep iax-operator
+
+Expected output:
+iax-operator-crd-<target-namespace>-validator   2   2025-12-02T...
+
+The VWC name follows the pattern iax-operator-crd-<namespace>-validator.
+
+Phase 3: Operator Installation
+Performed by: Installer (non-admin user)
+
+Frequency: Per installation
+Step 3.1: Create Operator Values File
+Save as operator-values.yaml:
+replicated:
+  isAirgap: true
+  image:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+    repository: obcerv/replicated-sdk-image
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+
+operator-namespaced:
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  image:
+    repository: obcerv/operator
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  webhook:
+    tls:
+      selfSigned: false
+      keystoreSecret: iax-operator-webhook-tls
+      keystoreSecretKey: keystore.p12
+      keystorePasswordSecret: iax-operator-webhook-tls-password
+
+Step 3.2: Install Operator
+helm install iax-operator ./iax-operator-namespaced-2.17.3.tgz \
+  --values operator-values.yaml \
+  --namespace <target-namespace>
+
+Step 3.3: Monitor Operator Deployment
+# Watch all pods in namespace
+kubectl get pods -n <target-namespace> -w
+
+Expected output after ~30-60 seconds:
+NAME                            READY   STATUS    RESTARTS   AGE
+iax-operator-xxxxxxxxxx-xxxxx   2/2     Running   0          30s
+replicated-xxxxxxxxxx-xxxxx     1/1     Running   0          30s
+
+Notes:
+·	The operator pod contains 2 containers: the operator itself and the webhook server
+·	The replicated pod provides SDK metadata functionality
+·	If pods don't start, check image pull issues first
+Check operator logs if needed:
+kubectl logs -n <target-namespace> deployment/iax-operator -c operator
+
+
+Phase 4: IAX Platform Installation
+Performed by: Installer
+
+Frequency: Per IAX platform instance
+Step 4.1: Create Platform Values File
+This guide provides the Medium HA configuration. This configuration provides:
+·	Service layer HA: 2 replicas for stateless services (platformd, sinkd, ingestion, keycloak, kvStore, licenced, dpd)
+·	Database HA: Timescale clusterSize: 3 (1 primary + 2 read replicas), Postgres clusterSize: 3, ClickHouse cluster size: 2
+·	Infrastructure HA: Kafka 3 replicas, etcd 3 replicas, ClickHouse Keeper 3 replicas
+·	Resource allocation: Sized for Medium workload
+Storage Configuration Options:
+1.	No configuration: Rely on the cluster's default StorageClass
+2.	Set defaultStorageClass once: Gets applied to all components
+3.	Be explicit per component: Overrides defaultStorageClass for specific components
+This guide sets defaultStorageClass: gp3 and explicitly sets TimescaleDB storage classes to gp3 to show how they can be overridden (e.g., to io2) if needed.
+Note: Storage classes are not reconfigurable after installation.
+Save as iax-values.yaml:
+kubectl:
+  image:
+    name: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com/obcerv/replicated-tools
+
+iax:
+  platformToolsImage: "obcerv/platform-tools"
+
+  # External hostnames - REQUIRED
+  apps:
+    externalHostname: iax-apps.contoso.net
+    ingress:
+      className: nginx
+      tlsSecret: apps-ingress-tls
+  
+  ingestion:
+    externalHostname: iax-ingestion.contoso.net
+    replicas: 2
+    ingress:
+      className: nginx
+      tlsSecret: ingestion-ingress-tls
+      annotations:
+        nginx.ingress.kubernetes.io/backend-protocol: GRPC
+        nginx.ingress.kubernetes.io/use-regex: "true"
+      usePathRegex: true
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "500m"
+      limits:
+        memory: "768Mi"
+        cpu: "750m"
+    traces:
+      jvmOpts: "-Xms2G -Xmx4G"
+      resources:
+        requests:
+          memory: "3Gi"
+          cpu: "2"
+        limits:
+          memory: "6Gi"
+          cpu: "3"
+  
+  iam:
+    toolsImage: obcerv/iam-tools
+    keycloak:
+      image: obcerv/keycloak
+      replicas: 2
+    ingress:
+      className: nginx
+  
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+    secret: artifactory-pull-secret
+  
+  tls:
+    internal:
+      enabled: false
+  
+  loki:
+    enabled: false
+  
+  collection:
+    image: obcerv/collection-agent
+    logs:
+      enabled: false
+    metrics:
+      disableKubeMetrics: true
+  
+  # Storage configuration
+  defaultStorageClass: gp3
+  
+  # Kafka configuration
+  kafka:
+    image: obcerv/kafka
+    healthCheck:
+      image: obcerv/kafka-health-check
+    replicas: 3
+    diskSize: "200Gi"
+    resources:
+      requests:
+        memory: "6Gi"
+        cpu: "2"
+      limits:
+        memory: "6Gi"
+        cpu: "4500m"
+    controller:
+      replicas: 3
+    producer:
+      bufferMemory: 67108864
+  
+  # Timescale configuration
+  timescale:
+    image: obcerv/timescale
+    schemaImage: obcerv/timescale-schema
+    healthCheck:
+      image: obcerv/timescale-health-check
+    sharedBuffersPercentage: 40
+    bgwLruMaxPages: 8000
+    walBuffers: 64000
+    clusterSize: 3
+    dataStorageClass: gp3
+    walStorageClass: gp3
+    timeseriesStorageClass: gp3
+    dataDiskSize: "100Gi"
+    timeseriesDiskCount: 4
+    timeseriesDiskSize: "1Ti"
+    walDiskSize: "250Gi"
+    maxLocksPerTransaction: 10000
+    resources:
+      requests:
+        memory: "56Gi"
+        cpu: "8"
+      limits:
+        memory: "56Gi"
+        cpu: "8"
+    nodeSelector:
+      instancegroup: timescale-nodes
+    tolerations:
+    - key: dedicated
+      operator: Equal
+      value: timescale-nodes
+      effect: NoSchedule
+    retention:
+      metrics:
+        chunkSize: 8h
+        retention: 30d
+      metrics_5m:
+        chunkSize: 1d
+        retention: 90d
+      metrics_1h:
+        chunkSize: 5d
+        retention: 180d
+      metrics_1d:
+        chunkSize: 20d
+        retention: 1y
+      statuses:
+        chunkSize: 7d
+        retention: 1y
+      signal_details:
+        chunkSize: 1d
+        retention: 30d
+  
+  # Platform services
+  platformd:
+    image: obcerv/platformd
+    replicas: 2
+    resources:
+      requests:
+        memory: "1536Mi"
+        cpu: "1"
+      limits:
+        memory: "2Gi"
+        cpu: "2250m"
+  
+  dpd:
+    image: obcerv/dpd
+    taskProvisioningUtilityImage: obcerv/data-pipeline-utility
+    replicas: 2
+    jvmOpts: "-Xmx4500M"
+    maxEntitySerdeCacheEntries: 1000000
+    entitiesInMemoryCacheSizeMb: 256
+    consumerProperties:
+      max.poll.records: 10000
+      fetch.min.bytes: 524288
+    metricsMultiplexer:
+      maxFilterResultCacheSize: 500000
+      maxConcurrentOps: 500
+      localParallelism: 12
+    selfMonitoringThresholds:
+      metrics_partition_lag_warn: 500000
+      metrics_partition_lag_critical: 2500000
+    resources:
+      requests:
+        memory: "5Gi"
+        cpu: "2500m"
+      limits:
+        memory: "6Gi"
+        cpu: "4500m"
+  
+  sinkd:
+    image: obcerv/sinkd
+    timeseriesCacheMaxSize: 2000000
+    jvmOpts: "-Xms1536M -Xmx1536M -XX:MaxDirectMemorySize=100M"
+    rawJvmOpts: "-Xms1024M -Xmx1536M"
+    replicas: 2
+    rawReplicas: 3
+    resources:
+      requests:
+        memory: "1536Mi"
+        cpu: "250m"
+      limits:
+        memory: "3Gi"
+        cpu: "3"
+    rawResources:
+      requests:
+        memory: "1280Mi"
+        cpu: "500m"
+      limits:
+        memory: "3Gi"
+        cpu: "3"
+    metrics:
+      consumerProperties:
+        max.partition.fetch.bytes: 524288
+        max.poll.records: 10000
+    dsMetrics:
+      consumerProperties:
+        max.partition.fetch.bytes: 1048576
+    loki:
+      consumerProperties:
+        max.partition.fetch.bytes: 1048576
+    entities:
+      consumerProperties:
+        max.partition.fetch.bytes: 1048576
+        max.poll.records: 75000
+    signals:
+      consumerProperties:
+        max.partition.fetch.bytes: 1048576
+    traces:
+      consumerProperties:
+        max.poll.records: 20000
+      resources:
+        requests:
+          memory: "756Mi"
+          cpu: "100m"
+        limits:
+          memory: "1200Mi"
+          cpu: "1"
+  
+  downsampledMetricsStream:
+    image: obcerv/downsampled-metrics-stream
+    replicas: 2
+    bucketedReplicas: 2
+    consumerProperties:
+      fetch.min.bytes: 524288
+      max.partition.fetch.bytes: 1048576
+      max.poll.records: 10000
+    resources:
+      requests:
+        memory: "3Gi"
+        cpu: "1"
+      limits:
+        memory: "3Gi"
+        cpu: "4"
+    bucketedConsumerProperties:
+      fetch.min.bytes: 524288
+      max.partition.fetch.bytes: 1048576
+      max.poll.records: 10000
+    bucketedJvmOpts: "-XX:InitialRAMPercentage=75 -XX:MaxRAMPercentage=75"
+    bucketedResources:
+      requests:
+        memory: "3Gi"
+        cpu: "1"
+      limits:
+        memory: "6Gi"
+        cpu: "4"
+    rocksdb:
+      raw:
+        indexAndFilterRatio: 0.5
+        memoryMib: 500
+        writeBufferMib: 16
+        writeBufferRatio: 0.25
+      bucketed:
+        indexAndFilterRatio: 0.5
+        memoryMib: 200
+        writeBufferMib: 16
+        writeBufferRatio: 0.25
+  
+  entityStream:
+    intermediate:
+      image: obcerv/intermediate-entity-stream
+      replicas: 2
+      consumerProperties:
+        max.partition.fetch.bytes: 1048576
+      storedEntitiesCacheSize: 10000
+      resources:
+        requests:
+          memory: "1536Mi"
+          cpu: "750m"
+        limits:
+          memory: "2Gi"
+          cpu: "2"
+      rocksdb:
+        memoryMib: 200
+    final:
+      image: obcerv/final-entity-stream
+      replicas: 2
+      jvmOpts: "-XX:InitialRAMPercentage=50 -XX:MaxRAMPercentage=50"
+      consumerProperties:
+        max.partition.fetch.bytes: 1048576
+      storedEntitiesCacheSize: 10000
+      resources:
+        requests:
+          memory: "1536Mi"
+          cpu: "1"
+        limits:
+          memory: "2560Mi"
+          cpu: "3"
+  
+  signalsStream:
+    image: obcerv/signals-stream
+    consumerProperties:
+      max.partition.fetch.bytes: 1048576
+    resources:
+      requests:
+        memory: "768Mi"
+        cpu: "150m"
+      limits:
+        memory: "1536Mi"
+        cpu: "1200m"
+  
+  kvStore:
+    replicas: 2
+  
+  licenced:
+    image: obcerv/licenced
+    replicas: 2
+  
+  etcd:
+    image: obcerv/etcd
+    replicas: 3
+  
+  postgres:
+    image: obcerv/postgres
+    clusterSize: 3
+  
+  clickhouse:
+    image: obcerv/clickhouse
+    schemaImage: obcerv/clickhouse-schema
+    traces:
+      replicas: 2
+      diskSize: "60Gi"
+      resources:
+        limits:
+          cpu: "4"
+          memory: "10Gi"
+        requests:
+          cpu: "4"
+          memory: "10Gi"
+    keeper:
+      replicas: 3
+  
+  platformStatusd:
+    image: obcerv/platform-statusd
+  
+  metricForecastd:
+    image: obcerv/metrics-forecastd
+  
+  configuration:
+    installerImage: obcerv/configuration-installer
+  
+  latestMetricsService:
+    image: obcerv/latest-metrics
+    replicas: 2
+    resources:
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+  
+  backup:
+    manager:
+      image: obcerv/backup-manager
+  
+  iamd:
+    image: obcerv/iamd
+
+Step 4.2: Install IAX Platform
+helm install iax ./iax-2.17.3.tgz \
+  --values iax-values.yaml \
+  --namespace <target-namespace> \
+  --timeout=20m
+
+About Helm timeout: The iax chart includes a post-install hook that waits for the IAXPlatform status to become DEPLOYED. Helm always waits for hooks to complete, and the default timeout is 5 minutes. Since platform deployment typically takes 5-15 minutes, use --timeout=20m. The --wait flag is not needed because the post-install hook already ensures the platform is fully deployed before Helm returns.
+Step 4.3: Monitor Platform Deployment
+# Watch IAXPlatform resource status
+kubectl get iaxplatform iax -n <target-namespace> -w
+
+# Watch all pods in namespace
+kubectl get pods -n <target-namespace>
+
+Deployment time: 5-10 minutes typically
+The operator deploys components in phases:
+1.	Infrastructure: PostgreSQL, etcd, Kafka, Keycloak
+2.	Core Services: Configuration, platformd, dpd, kvStore
+3.	Data Services: Entity streams, signals stream, sinkd
+4.	Platform Ready: IAXPlatform status shows DEPLOYED
+
+Phase 5: Applications Installation
+Performed by: Installer
+
+Frequency: Per application
+Applications are installed as separate Helm charts after the platform is ready.
+Step 5.1: Verify Platform Ready
+kubectl get iaxplatform iax -n <target-namespace> -o jsonpath='{.status.status}'
+
+Should return: DEPLOYED
+Step 5.2: Application Selection
+Core Applications:
+·	Web Console
+·	Query Service
+·	Entities
+·	Commands
+·	IAM
+·	Ingestion
+Additional Applications:
+·	Alerting
+·	API Gateway
+·	Notifications
+·	Dashboard
+·	Audit
+·	Traces
+·	Signal Forecaster
+·	Capacity Planner
+·	Capacity
+·	Centralised Config
+·	FIX Monitor
+·	Signal Generator
+Step 5.3: Create App Values Files
+All applications use the same values pattern. Save each as app-<name>-values.yaml:
+Web Console - app-webconsole-values.yaml:
+iax-app-webconsole:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  image:
+    repository: /obcerv/obcerv-app-webconsole
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  ingress:
+    className: nginx
+
+Query Service - app-query-service-values.yaml:
+obcerv-app-query-service:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  bff:
+    image:
+      repository: /obcerv/obcerv-app-query-service-bff-daemon
+  bffIntelliViews:
+    image:
+      repository: /obcerv/obcerv-app-query-service-bff-intelli-views-daemon
+  sink:
+    image:
+      repository: /obcerv/obcerv-app-query-service-sink-daemon
+  db:
+    image:
+      repository: /obcerv/cgr-postgres
+  utils:
+    image:
+      repository: /obcerv/cgr-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+
+Entities - app-entities-values.yaml:
+iax-app-entities:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-entities-ui
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Commands - app-commands-values.yaml:
+obcerv-app-commands:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-commands-ui
+  daemon:
+    image:
+      repository: /obcerv/obcerv-app-commands-daemon
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+
+IAM - app-iam-values.yaml:
+iax-app-iam:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  image:
+    repository: /obcerv/iax-app-iam-ui
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  setup:
+    image:
+      repository: /obcerv/iax-app-iam-setup
+  daemon:
+    image:
+      repository: /obcerv/iax-app-iam-daemon
+  ingress:
+    className: nginx
+
+Ingestion - app-ingestion-values.yaml:
+iax-app-ingestion:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-ingestion-ui
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Alerting - app-alerting-values.yaml:
+iax-app-alerting:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-alerting-ui
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+API Gateway - app-api-gateway-values.yaml:
+iax-app-api-gateway:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-api-gateway
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Notifications - app-notifications-values.yaml:
+iax-app-notifications:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-notifications-ui
+  notifier:
+    image:
+      repository: /obcerv/obcerv-app-notifications-notifier-daemon
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Dashboard - app-dashboard-values.yaml:
+iax-app-dashboard:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-dashboard-ui
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Audit - app-audit-values.yaml:
+iax-app-audit:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-audit-ui
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Traces - app-traces-values.yaml:
+iax-app-traces:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-traces-ui
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Signal Forecaster - app-signal-forecaster-values.yaml:
+iax-app-signal-forecaster:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-signal-forecaster-ui
+  forecaster:
+    image:
+      repository: /obcerv/obcerv-app-signal-forecaster-daemon
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Capacity Planner - app-capacity-planner-values.yaml:
+iax-app-capacity-planner:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-capacity-planner-ui
+  entities:
+    image:
+      repository: /obcerv/obcerv-app-capacity-planner-entities-daemon
+  metrics:
+    image:
+      repository: /obcerv/obcerv-app-capacity-planner-metrics-daemon
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Capacity - app-capacity-values.yaml:
+iax-app-capacity:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/app/iax-app-capacity-ui
+  daemon:
+    image:
+      repository: /obcerv/app/iax-app-capacity-daemon
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Centralised Config - app-centralised-config-values.yaml:
+obcerv-app-centralised-config:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-centralised-config-ui
+  daemon:
+    image:
+      repository: /obcerv/obcerv-app-centralised-config-daemon
+  restServer:
+    image:
+      repository: /obcerv/obcerv-app-centralised-config-rest-server
+  utils:
+    image:
+      repository: /obcerv/cgr-tools
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+FIX Monitor - app-fixmonitor-values.yaml:
+obcerv-app-fixmonitor:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/obcerv-app-fixmonitor-ui
+  bffDaemon:
+    image:
+      repository: /obcerv/obcerv-app-fixmonitor-bff-daemon
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Signal Generator - app-signal-generator-values.yaml:
+iax-app-signal-generator:
+  externalHostname: iax-apps.contoso.net
+  docker:
+    registry: containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com
+  imagePullSecrets:
+    - name: artifactory-pull-secret
+  traces:
+    enabled: false
+  image:
+    repository: /obcerv/app/iax-app-signal-generator-ui
+  daemon:
+    image:
+      repository: /obcerv/app/iax-app-signal-generator-daemon
+  cleanup:
+    image:
+      repository: /obcerv/app/iax-app-signal-generator-cleanup-client
+  iam:
+    image:
+      repository: /obcerv/iam-tools
+  platformTools:
+    image:
+      repository: /obcerv/obcerv-app-platform-tools-cli
+  ingress:
+    className: nginx
+
+Step 5.4: Install Core Applications
+Install the core applications in this order:
+# 1. Web Console
+helm install iax-app-webconsole ./iax-app-webconsole-2.17.3.tgz \
+  --values app-webconsole-values.yaml \
+  --namespace <target-namespace>
+
+# 2. Query Service
+helm install iax-app-query-service ./iax-app-query-service-2.17.3.tgz \
+  --values app-query-service-values.yaml \
+  --namespace <target-namespace>
+
+# 3. Entities
+helm install iax-app-entities ./iax-app-entities-2.17.3.tgz \
+  --values app-entities-values.yaml \
+  --namespace <target-namespace>
+
+# 4. Commands
+helm install iax-app-commands ./iax-app-commands-2.17.3.tgz \
+  --values app-commands-values.yaml \
+  --namespace <target-namespace>
+
+# 5. IAM
+helm install iax-app-iam ./iax-app-iam-2.17.3.tgz \
+  --values app-iam-values.yaml \
+  --namespace <target-namespace>
+
+# 6. Ingestion
+helm install iax-app-ingestion ./iax-app-ingestion-2.17.3.tgz \
+  --values app-ingestion-values.yaml \
+  --namespace <target-namespace>
+
+Step 5.5: Install Additional Apps (Optional)
+Additional apps can be installed as needed. Install them in this order:
+# 7. Alerting
+helm install iax-app-alerting ./iax-app-alerting-2.17.3.tgz \
+  --values app-alerting-values.yaml \
+  --namespace <target-namespace>
+
+# 8. API Gateway
+helm install iax-app-api-gateway ./iax-app-api-gateway-2.17.3.tgz \
+  --values app-api-gateway-values.yaml \
+  --namespace <target-namespace>
+
+# 9. Notifications
+helm install iax-app-notifications ./iax-app-notifications-2.17.3.tgz \
+  --values app-notifications-values.yaml \
+  --namespace <target-namespace>
+
+# 10. Dashboard
+helm install iax-app-dashboard ./iax-app-dashboard-2.17.3.tgz \
+  --values app-dashboard-values.yaml \
+  --namespace <target-namespace>
+
+# 11. Audit
+helm install iax-app-audit ./iax-app-audit-2.17.3.tgz \
+  --values app-audit-values.yaml \
+  --namespace <target-namespace>
+
+# 12. Traces
+helm install iax-app-traces ./iax-app-traces-2.17.3.tgz \
+  --values app-traces-values.yaml \
+  --namespace <target-namespace>
+
+# 13. Signal Forecaster
+helm install iax-app-signal-forecaster ./iax-app-signal-forecaster-2.17.3.tgz \
+  --values app-signal-forecaster-values.yaml \
+  --namespace <target-namespace>
+
+# 14. Capacity Planner
+helm install iax-app-capacity-planner ./iax-app-capacity-planner-2.17.3.tgz \
+  --values app-capacity-planner-values.yaml \
+  --namespace <target-namespace>
+
+# 15. Capacity
+helm install iax-app-capacity ./iax-app-capacity-2.17.3.tgz \
+  --values app-capacity-values.yaml \
+  --namespace <target-namespace>
+
+# 16. Centralised Config
+helm install iax-app-centralised-config ./iax-app-centralised-config-2.17.3.tgz \
+  --values app-centralised-config-values.yaml \
+  --namespace <target-namespace>
+
+# 17. FIX Monitor
+helm install iax-app-fixmonitor ./iax-app-fixmonitor-2.17.3.tgz \
+  --values app-fixmonitor-values.yaml \
+  --namespace <target-namespace>
+
+# 18. Signal Generator
+helm install iax-app-signal-generator ./iax-app-signal-generator-2.17.3.tgz \
+  --values app-signal-generator-values.yaml \
+  --namespace <target-namespace>
+
+
+Phase 6: Support Bundle Collection Setup
+Overview
+The iax-installation-support Helm chart provides support bundle and preflight check configurations for troubleshooting and diagnostics. This chart creates:
+·	ConfigMaps with support bundle specifications defining what data to collect
+·	ServiceAccount with RBAC for diagnostic collectors (nodes-resources, kubectl-top, etc.)
+·	Preflight checks for validating cluster configuration
+Installation
+Install with namespace-scoped RBAC to match your deployment model:
+helm install iax-support ./iax-installation-support-2.17.3.tgz \
+  --namespace <target-namespace> \
+  --set iax-troubleshoot.rbac.scope=namespace \
+  --set iax-troubleshoot.image.registry=containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com \
+  --set iax-troubleshoot.image.repository=obcerv/replicated-tools \
+  --set iax-troubleshoot.image.pullSecrets[0]=artifactory-pull-secret \
+  --set iax-troubleshoot.platformTools.image.registry=containerregistry-na.contosohase.net/container-external/proxy.xcomgroup.com/proxy/xx/docker.xcomgroup.com \
+  --set iax-troubleshoot.platformTools.image.repository=obcerv/platform-tools
+
+Collecting Support Bundles
+Once the chart is installed, users can collect support bundles:
+kubectl support-bundle --load-cluster-specs -n <target-namespace>
+
+This will generate a tarball (e.g., support-bundle-YYYY-MM-DDTHH_MM_SS.tar.gz) containing:
+·	Pod logs from all platform components
+·	Namespace resources (deployments, services, configmaps, etc.)
+·	Diagnostic data from collector pods (resource usage, storage checks, etc.)
+·	Helm release information
+What is NOT collected (namespace-scoped installation):
+·	Cluster-level resources (nodes, storage classes, etc.)
+·	Resources from other namespaces
+
+Verification
+Step 1: Check Platform Status
+kubectl get iaxplatform iax -n <target-namespace>
+
+Should show:
+NAME   AGE
+iax    15m
+
+To verify the platform is deployed:
+kubectl get iaxplatform iax -n <target-namespace> -o jsonpath='{.status.status}'
+
+Should return: DEPLOYED
+Step 2: Check All Pods Running
+kubectl get pods -n <target-namespace>
+
+All pods should be in Running state with appropriate number of replicas ready (e.g., 2/2, 1/1, etc.).
+To check for any pods not running:
+kubectl get pods -n <target-namespace> --field-selector=status.phase!=Running
+
+This should return no results (or only completed jobs).
+Step 3: Check Ingress
+kubectl get ingress -n <target-namespace>
+
+You should see at minimum (for core apps):
+·	iax-apps-ingress
+·	iax-ingestion-ingress
+·	iax-app-wc-ingress (Web Console)
+·	iax-app-qs-ingress (Query Service)
+·	iax-app-entities-ingress (Entities)
+·	iax-app-commands-ingress (Commands)
+·	iax-app-iam-ingress (IAM)
+·	iax-app-ingestion-ingress (Ingestion)
+And if additional apps are installed:
+·	iax-app-alerting-ingress (Alerting)
+·	iax-app-api-gateway-ingress (API Gateway)
+·	iax-app-notifications-ingress (Notifications)
+·	iax-app-dashboard-ingress (Dashboard)
+·	iax-app-audit-ingress (Audit)
+·	iax-app-traces-ingress (Traces)
+·	iax-app-signal-forecaster-ingress (Signal Forecaster)
+·	iax-app-capacity-planner-ingress (Capacity Planner)
+·	iax-app-capacity-ingress (Capacity)
+·	iax-app-centralised-config-ingress (Centralised Config)
+·	iax-app-fixmonitor-ingress (FIX Monitor)
+·	iax-app-signal-generator-ingress (Signal Generator)
+Step 4: Get Initial Credentials
+# Get password for 'admin' user
+kubectl get secret iam-initial-credentials -n <target-namespace> \
+  -o jsonpath='{.data.obcerv-admin}' | base64 -d && echo
+
+# Get password for 'xcom' user  
+kubectl get secret iam-initial-credentials -n <target-namespace> \
+  -o jsonpath='{.data.obcerv-xcom}' | base64 -d && echo
+
+Step 5: Access Web UI
+Navigate to https://iax-apps.contoso.net (your configured hostname) and log in with:
+·	Username: admin
+·	Password: (from Step 4 - obcerv-admin secret key)
+Step 6: Verify Storage Classes
+# Check TimescaleDB PVCs
+kubectl get pvc -n <target-namespace> | grep timescale
+
+Step 7: Check Application Deployment
+# Check all application pods are running
+kubectl get pods -n <target-namespace> -l app.kubernetes.io/managed-by=Helm
+
+All application pods should be in Running state.
+
